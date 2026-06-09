@@ -83,6 +83,10 @@ impl CodexForecaster {
                 .arg(format!("model_reasoning_effort={effort:?}"));
         }
 
+        // Ensure a timed-out or dropped forecast cannot orphan a running
+        // codex process.
+        command.kill_on_drop(true);
+
         let mut child = command.spawn().context(
             "spawning codex; is the Codex CLI installed and logged in? (npm i -g @openai/codex && codex login)",
         )?;
@@ -96,6 +100,9 @@ impl CodexForecaster {
             .context("writing prompt to codex")?;
         drop(stdin);
 
+        // `wait_with_output` consumes the child, so a plain timeout would
+        // leave no handle to kill; `kill_on_drop` above ensures the process
+        // dies when the timed-out future is dropped.
         let output = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
             .map_err(|_| anyhow!("codex exec timed out after {:?}", self.timeout))?

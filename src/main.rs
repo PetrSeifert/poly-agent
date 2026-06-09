@@ -18,7 +18,10 @@ use crate::policy::{POLICY_VERSION, PolicyConfig, PolicyDecision};
 use crate::types::{ExecutionMode, OrderStatus};
 
 #[derive(Parser)]
-#[command(name = "poly-agent", about = "Paper-trading agent for prediction markets")]
+#[command(
+    name = "poly-agent",
+    about = "Paper-trading agent for prediction markets"
+)]
 struct Cli {
     /// Path to the SQLite ledger database.
     #[arg(long, default_value = "ledger.db")]
@@ -61,7 +64,12 @@ enum Command {
         /// Minimum post-fee edge in probability points.
         #[arg(long, default_value_t = 0.05)]
         min_edge: f64,
+        /// Taker fee rate; per-share fee is `fee_rate * p * (1 - p)`.
+        #[arg(long, default_value_t = 0.05)]
+        fee_rate: f64,
     },
+    /// Check open positions against official resolutions and realize PnL.
+    Settle,
     /// Show paper account state: cash, fees, open positions, marked equity.
     Report,
     /// Serve a live web dashboard for reviewing results in realtime.
@@ -90,6 +98,9 @@ enum Command {
         /// Minimum post-fee edge in probability points.
         #[arg(long, default_value_t = 0.05)]
         min_edge: f64,
+        /// Taker fee rate; per-share fee is `fee_rate * p * (1 - p)`.
+        #[arg(long, default_value_t = 0.05)]
+        fee_rate: f64,
         /// Codex model override (e.g. gpt-5-codex); defaults to the CLI default.
         #[arg(long)]
         model: Option<String>,
@@ -106,8 +117,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -127,10 +137,15 @@ async fn main() -> anyhow::Result<()> {
             prob,
             limit,
         } => run_forecast(&ledger, &exchange, market_id, prob, limit).await,
-        Command::Trade { limit, min_edge } => {
+        Command::Trade {
+            limit,
+            min_edge,
+            fee_rate,
+        } => {
             let universe = select_universe(&ledger, limit)?;
-            trade(&ledger, &exchange, &universe, min_edge).await
+            trade(&ledger, &exchange, &universe, min_edge, fee_rate).await
         }
+        Command::Settle => settle(&ledger, &exchange).await,
         Command::Report => report(&ledger),
         Command::Serve { port } => server::serve(cli.db.clone(), port).await,
         Command::Run {
@@ -140,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             max_llm_calls,
             forecast_refresh_hours,
             min_edge,
+            fee_rate,
             model,
             reasoning_effort,
             codex_bin,
@@ -161,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
                     max_llm_calls,
                     forecast_refresh_hours,
                     min_edge,
+                    fee_rate,
                 },
             )
             .await
@@ -175,6 +192,7 @@ struct RunConfig {
     max_llm_calls: usize,
     forecast_refresh_hours: f64,
     min_edge: f64,
+    fee_rate: f64,
 }
 
 /// Multi-outcome events (e.g. "who wins the World Cup") appear as dozens of
@@ -222,8 +240,8 @@ async fn run_simulation(
     forecaster: &llm::CodexForecaster,
     config: RunConfig,
 ) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs_f64(config.hours * 3600.0);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(config.hours * 3600.0);
     let cycle_duration = std::time::Duration::from_secs_f64(config.cycle_minutes * 60.0);
     let refresh_age = chrono::Duration::seconds((config.forecast_refresh_hours * 3600.0) as i64);
     let mut cycle = 0u32;
@@ -257,7 +275,9 @@ async fn run_simulation(
 
         // Forecast the markets with the stalest forecasts first, within budget.
         let min_close = chrono::Utc::now()
-            + chrono::Duration::seconds((PolicyConfig::default().min_hours_to_close * 3600.0) as i64);
+            + chrono::Duration::seconds(
+                (PolicyConfig::default().min_hours_to_close * 3600.0) as i64,
+            );
         let mut stale: Vec<(chrono::Duration, &types::Market, triage::TriageProfile)> = Vec::new();
         for market in &universe {
             // Don't spend LLM calls on markets the policy will reject anyway.
@@ -357,8 +377,22 @@ async fn run_simulation(
             }
         }
 
-        if let Err(error) = trade(ledger, exchange, &universe, config.min_edge).await {
+        if let Err(error) = trade(
+            ledger,
+            exchange,
+            &universe,
+            config.min_edge,
+            config.fee_rate,
+        )
+        .await
+        {
             error!(%error, "trade pass failed");
+        }
+
+        // Settle resolved markets before marking equity, so realized PnL is
+        // separated from mark-to-market noise.
+        if let Err(error) = settle(ledger, exchange).await {
+            error!(%error, "settlement pass failed");
         }
 
         match ledger.record_equity_snapshot() {
@@ -393,11 +427,7 @@ async fn run_simulation(
     report(ledger)
 }
 
-async fn discover(
-    ledger: &Ledger,
-    exchange: &PolymarketIntl,
-    limit: usize,
-) -> anyhow::Result<()> {
+async fn discover(ledger: &Ledger, exchange: &PolymarketIntl, limit: usize) -> anyhow::Result<()> {
     let filter = types::MarketFilter {
         active_only: true,
         limit,
@@ -441,7 +471,11 @@ async fn record(
             }
         }
     }
-    info!(recorded, markets = markets.len(), "orderbook recording complete");
+    info!(
+        recorded,
+        markets = markets.len(),
+        "orderbook recording complete"
+    );
     Ok(())
 }
 
@@ -499,9 +533,11 @@ async fn trade(
     exchange: &PolymarketIntl,
     markets: &[types::Market],
     min_edge: f64,
+    fee_rate: f64,
 ) -> anyhow::Result<()> {
     let policy_config = PolicyConfig {
         min_edge,
+        fee_rate,
         ..PolicyConfig::default()
     };
     let broker = PaperBroker::new(PaperBrokerConfig {
@@ -511,7 +547,11 @@ async fn trade(
     let mode = ExecutionMode::Paper;
 
     let bankroll = ledger.cash()?;
-    info!(bankroll, markets = markets.len(), "starting paper trading pass");
+    info!(
+        bankroll,
+        markets = markets.len(),
+        "starting paper trading pass"
+    );
 
     for market in markets {
         let Some(forecast) = ledger.latest_forecast(&market.market_id)? else {
@@ -529,11 +569,28 @@ async fn trade(
         };
         ledger.insert_snapshot(exchange.venue(), &market.market_id, &yes_book)?;
 
+        // Fetch the NO book up front so the policy prices the NO side from
+        // the book it would actually execute against, not 1 - YES bid.
+        let no_book = match &market.no_token_id {
+            Some(no_token) => match exchange.get_orderbook(no_token).await {
+                Ok(book) => {
+                    ledger.insert_snapshot(exchange.venue(), &market.market_id, &book)?;
+                    Some(book)
+                }
+                Err(error) => {
+                    warn!(market = %market.slug, %error, "no NO book; evaluating YES side only");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let existing_cost = ledger.position_cost(&market.market_id)?;
         let decision = policy::evaluate(
             &policy_config,
             market,
             &yes_book,
+            no_book.as_ref(),
             &forecast,
             bankroll,
             existing_cost,
@@ -550,13 +607,10 @@ async fn trade(
         let execution_book = if order.token_id == yes_book.token_id {
             yes_book
         } else {
-            match exchange.get_orderbook(&order.token_id).await {
-                Ok(book) => {
-                    ledger.insert_snapshot(exchange.venue(), &market.market_id, &book)?;
-                    book
-                }
-                Err(error) => {
-                    warn!(market = %market.slug, %error, "skipping, no execution book");
+            match no_book {
+                Some(book) if order.token_id == book.token_id => book,
+                _ => {
+                    warn!(market = %market.slug, "skipping, no execution book");
                     continue;
                 }
             }
@@ -608,6 +662,40 @@ async fn trade(
     Ok(())
 }
 
+/// Poll Gamma for resolutions of markets with open positions and settle any
+/// that resolved: pay out shares, realize PnL, and close the positions.
+async fn settle(ledger: &Ledger, exchange: &PolymarketIntl) -> anyhow::Result<()> {
+    let market_ids = ledger.unsettled_position_markets()?;
+    if market_ids.is_empty() {
+        info!("no open positions awaiting resolution");
+        return Ok(());
+    }
+    let mut settled = 0;
+    for market_id in &market_ids {
+        match exchange.get_resolution(market_id).await {
+            Ok(Some(resolution)) => {
+                let (payout, realized_pnl) = ledger.settle_market(&resolution)?;
+                settled += 1;
+                info!(
+                    market_id,
+                    payout = format!("{payout:.2}"),
+                    realized_pnl = format!("{realized_pnl:.2}"),
+                    "market settled"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(market_id, %error, "resolution check failed");
+            }
+        }
+    }
+    info!(
+        checked = market_ids.len(),
+        settled, "settlement pass complete"
+    );
+    Ok(())
+}
+
 fn report(ledger: &Ledger) -> anyhow::Result<()> {
     let summary = ledger.summary()?;
     println!("cash:          {:.2}", summary.cash);
@@ -637,7 +725,10 @@ fn report(ledger: &Ledger) -> anyhow::Result<()> {
         );
     }
     if have_marks {
-        println!("equity (liquidation): {:.2}", summary.cash + mtm_liquidation);
+        println!(
+            "equity (liquidation): {:.2}",
+            summary.cash + mtm_liquidation
+        );
         println!("equity (midpoint):    {:.2}", summary.cash + mtm_mid);
     } else {
         println!("equity: incomplete marks; run `record` to refresh snapshots");
@@ -645,6 +736,22 @@ fn report(ledger: &Ledger) -> anyhow::Result<()> {
 
     let (filled, rejected) = ledger.order_counts()?;
     println!("orders: {filled} filled, {rejected} rejected");
+
+    let settlements = ledger.recent_settlements(20)?;
+    if !settlements.is_empty() {
+        println!("\nrecent settlements:");
+        for settlement in &settlements {
+            println!(
+                "  {}  {} {} x{:.0} payout {:.2} pnl {:+.2}",
+                &settlement.settled_at[..19.min(settlement.settled_at.len())],
+                settlement.question,
+                settlement.outcome,
+                settlement.shares,
+                settlement.payout,
+                settlement.realized_pnl,
+            );
+        }
+    }
 
     let curve = ledger.equity_curve(500)?;
     if !curve.is_empty() {
@@ -655,8 +762,7 @@ fn report(ledger: &Ledger) -> anyhow::Result<()> {
         let span = (high - low).max(1e-9);
         for (ts, liquidation, midpoint, open_positions) in &curve {
             let width = 40usize;
-            let filled_width =
-                (((liquidation - low) / span) * width as f64).round() as usize;
+            let filled_width = (((liquidation - low) / span) * width as f64).round() as usize;
             let bar: String = "#".repeat(filled_width.min(width));
             println!(
                 "  {}  {:>9.2} liq / {:>9.2} mid  ({} pos) |{:<width$}|",

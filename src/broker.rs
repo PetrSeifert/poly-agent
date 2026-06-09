@@ -125,13 +125,17 @@ fn reject(reason: &str) -> PaperFillResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Outcome, OrderType, PriceLevel};
+    use crate::types::{OrderType, Outcome, PriceLevel};
     use chrono::Utc;
 
     fn book(asks: Vec<(f64, f64)>) -> OrderBook {
         OrderBook {
             token_id: "t".to_string(),
             ts: Utc::now(),
+            condition_id: None,
+            exchange_ts: None,
+            hash: None,
+            neg_risk: None,
             bids: vec![],
             asks: asks
                 .into_iter()

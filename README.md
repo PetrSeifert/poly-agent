@@ -19,7 +19,9 @@ execution, no keys, no authentication.
   edge. An opportunity score (category prior, liquidity, spread tightness,
   forecast staleness) ranks markets for the scarce LLM forecast budget.
 - **Ledger** (`src/ledger.rs`): SQLite schema for markets, orderbook
-  snapshots, forecasts, orders, fills, positions, and the paper account.
+  snapshots (including CLOB condition ID, exchange timestamp, and book hash),
+  forecasts, orders, fills, positions, resolutions, settlements, and the
+  paper account.
 - **Paper broker** (`src/broker.rs`): simulates marketable orders by walking
   the live book — fills against real depth, applies the `feeRate * p * (1 - p)`
   taker fee model, tracks slippage, and rejects orders the book cannot satisfy
@@ -27,6 +29,9 @@ execution, no keys, no authentication.
 - **Trading policy** (`src/policy.rs`): deterministic gate — trades only when
   post-fee edge exceeds a threshold (scaled by the triage category and rules
   clarity), with spread, time-to-close, and per-market position-size limits.
+  Each side is priced from the orderbook of the token that would actually be
+  bought (the NO edge uses the real NO ask, never `1 - YES bid`), and the
+  spread gate applies to the selected token's book.
   Shrinks forecasts toward the market price
   (`p = w * p_agent + (1 - w) * p_market`), where `w` includes both the
   model's confidence and the triage trust factor for the domain.
@@ -54,10 +59,13 @@ cargo run -- record --limit 20
 cargo run -- forecast --limit 20
 cargo run -- forecast --market-id 558969 --prob 0.40
 
-# 4. Run the policy and paper-trade
-cargo run -- trade --limit 20 --min-edge 0.05
+# 4. Run the policy and paper-trade (taker fee rate is configurable)
+cargo run -- trade --limit 20 --min-edge 0.05 --fee-rate 0.05
 
-# 5. Account state: cash, positions, equity curve, order counts
+# 5. Settle open positions against official (UMA) resolutions
+cargo run -- settle
+
+# 6. Account state: cash, realized PnL, positions, settlements, equity curve
 cargo run -- report
 ```
 
@@ -77,7 +85,7 @@ codex login
 ```
 
 Then run the loop (discover → snapshot → Codex forecast → paper trade →
-equity snapshot, repeated each cycle):
+settle resolved markets → equity snapshot, repeated each cycle):
 
 ```bash
 cargo run --release -- run \
@@ -132,9 +140,11 @@ bankroll is set on first run (`--starting-cash`, default 1000).
 
 ## Not yet implemented
 
-Per the staged-mode plan in `IMPLEMENTATION_RESEARCH.md`: settlement against official
-resolution data, limit-order queue simulation, WebSocket streaming,
-calibration/evaluation reports, the LLM research layer, and any live adapter.
+Per the staged-mode plan in `IMPLEMENTATION_RESEARCH.md`: per-market fee
+parameter lookup from CLOB market info (a flat `--fee-rate` is used instead),
+limit-order queue simulation, WebSocket streaming, calibration/evaluation
+reports, the external-evidence layer for the LLM (structured reference
+prices, sportsbook lines, weather data), and any live adapter.
 `ExecutionMode` already enumerates the live modes so enabling them later is an
 explicit, typed decision.
 

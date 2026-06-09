@@ -2,7 +2,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::types::{Market, MarketFilter, OrderBook, PriceLevel, Venue};
+use crate::types::{Market, MarketFilter, MarketResolution, OrderBook, PriceLevel, Venue};
 
 #[async_trait::async_trait]
 pub trait ExchangeAdapter: Send + Sync {
@@ -39,6 +39,7 @@ impl PolymarketIntl {
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
     id: String,
+    condition_id: Option<String>,
     slug: Option<String>,
     question: Option<String>,
     description: Option<String>,
@@ -52,6 +53,10 @@ struct GammaMarket {
     volume_24hr: Option<f64>,
     liquidity: Option<serde_json::Value>,
     events: Option<Vec<GammaEventRef>>,
+    /// JSON-encoded string, e.g. "[\"1\", \"0\"]"; per-share payouts in
+    /// clob_token_ids order once the market resolves.
+    outcome_prices: Option<String>,
+    uma_resolution_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +93,7 @@ impl GammaMarket {
                 .and_then(|events| events.first())
                 .map(|event| event.id.clone()),
             market_id: self.id,
+            condition_id: self.condition_id,
             slug: self.slug.unwrap_or_default(),
             question: self.question.unwrap_or_default(),
             resolution_rules: self.description,
@@ -103,6 +109,63 @@ impl GammaMarket {
     }
 }
 
+impl PolymarketIntl {
+    /// Fetch the resolution state of a single market from Gamma. Returns
+    /// `None` while the market is still open or its UMA resolution is not
+    /// final yet.
+    pub async fn get_resolution(
+        &self,
+        market_id: &str,
+    ) -> anyhow::Result<Option<MarketResolution>> {
+        let url = format!("{}/markets/{}", self.gamma_base, market_id);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("requesting gamma market by id")?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "gamma market {} returned {}",
+                market_id,
+                response.status()
+            ));
+        }
+        let raw_json: serde_json::Value = response.json().await.context("decoding gamma market")?;
+        let market: GammaMarket =
+            serde_json::from_value(raw_json.clone()).context("parsing gamma market")?;
+
+        if !market.closed.unwrap_or(false)
+            || market.uma_resolution_status.as_deref() != Some("resolved")
+        {
+            return Ok(None);
+        }
+        let payouts: Vec<f64> = match market
+            .outcome_prices
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        {
+            Some(prices) => prices
+                .iter()
+                .map(|price| price.parse::<f64>())
+                .collect::<Result<_, _>>()
+                .context("parsing outcome prices")?,
+            None => return Ok(None),
+        };
+        let (Some(&payout_yes), Some(&payout_no)) = (payouts.first(), payouts.get(1)) else {
+            return Ok(None);
+        };
+        Ok(Some(MarketResolution {
+            venue: Venue::PolymarketInternational,
+            market_id: market_id.to_string(),
+            payout_yes,
+            payout_no,
+            resolution_source: "gamma_uma".to_string(),
+            raw: raw_json,
+        }))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ClobBookLevel {
     price: String,
@@ -111,6 +174,12 @@ struct ClobBookLevel {
 
 #[derive(Debug, Deserialize)]
 struct ClobBook {
+    /// CLOB condition ID for the market this token belongs to.
+    market: Option<String>,
+    /// Exchange-side timestamp in milliseconds since the epoch.
+    timestamp: Option<String>,
+    hash: Option<String>,
+    neg_risk: Option<bool>,
     #[serde(default)]
     bids: Vec<ClobBookLevel>,
     #[serde(default)]
@@ -150,6 +219,9 @@ impl ExchangeAdapter for PolymarketIntl {
         let mut markets = Vec::new();
         while markets.len() < limit {
             let page_limit = (limit - markets.len()).min(PAGE_SIZE);
+            // Verified against the live API (2026-06): `order=volume24hr`
+            // sorts correctly, while the docs' `order=volume_24hr` spelling
+            // is silently ignored and returns id-ordered results.
             let mut url = format!(
                 "{}/markets?limit={}&offset={}&order=volume24hr&ascending=false",
                 self.gamma_base,
@@ -201,9 +273,19 @@ impl ExchangeAdapter for PolymarketIntl {
         bids.sort_by(|a, b| b.price.total_cmp(&a.price));
         asks.sort_by(|a, b| a.price.total_cmp(&b.price));
 
+        let exchange_ts = raw
+            .timestamp
+            .as_deref()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .and_then(DateTime::<Utc>::from_timestamp_millis);
+
         Ok(OrderBook {
             token_id: token_id.to_string(),
             ts: Utc::now(),
+            condition_id: raw.market,
+            exchange_ts,
+            hash: raw.hash,
+            neg_risk: raw.neg_risk,
             bids,
             asks,
             tick_size: raw.tick_size.and_then(|raw| raw.parse().ok()),

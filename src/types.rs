@@ -74,6 +74,9 @@ pub struct Market {
     pub venue: Venue,
     pub event_id: Option<String>,
     pub market_id: String,
+    /// CLOB condition ID; links Gamma metadata to CLOB books, fee
+    /// parameters, and on-chain resolution.
+    pub condition_id: Option<String>,
     pub slug: String,
     pub question: String,
     pub resolution_rules: Option<String>,
@@ -96,7 +99,21 @@ pub struct PriceLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
     pub token_id: String,
+    /// Local receive time.
     pub ts: DateTime<Utc>,
+    /// CLOB condition ID ("market" in the book response); links the book to
+    /// market info, fee parameters, and settlement.
+    #[serde(default)]
+    pub condition_id: Option<String>,
+    /// Exchange-side timestamp of the book, for latency/staleness analysis.
+    #[serde(default)]
+    pub exchange_ts: Option<DateTime<Utc>>,
+    /// Orderbook content hash, for stale-book detection and deduplication.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Whether the token belongs to a negative-risk (multi-outcome) event.
+    #[serde(default)]
+    pub neg_risk: Option<bool>,
     /// Sorted best-first (descending price).
     pub bids: Vec<PriceLevel>,
     /// Sorted best-first (ascending price).
@@ -188,6 +205,19 @@ pub struct Forecast {
     pub confidence: f64,
     pub model_version: String,
     pub rationale: serde_json::Value,
+}
+
+/// Resolution outcome for a settled market. Payouts are per share for the
+/// YES/NO tokens (normally 1.0/0.0 or 0.0/1.0, but fractional payouts such
+/// as 0.5/0.5 ties are representable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketResolution {
+    pub venue: Venue,
+    pub market_id: String,
+    pub payout_yes: f64,
+    pub payout_no: f64,
+    pub resolution_source: String,
+    pub raw: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]

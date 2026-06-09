@@ -56,45 +56,153 @@ pub enum RulesClarity {
 }
 
 const CRYPTO_KEYWORDS: &[&str] = &[
-    "bitcoin", "btc", "ethereum", " eth ", "solana", " sol ", "crypto", "xrp", "dogecoin",
-    "stablecoin", "binance", "coinbase", "market cap of", "token", "altcoin",
+    "bitcoin",
+    "btc",
+    "ethereum",
+    " eth ",
+    "solana",
+    " sol ",
+    "crypto",
+    "xrp",
+    "dogecoin",
+    "stablecoin",
+    "binance",
+    "coinbase",
+    "market cap of",
+    "token",
+    "altcoin",
 ];
 
 const SPORTS_KEYWORDS: &[&str] = &[
-    "nba", "nfl", "mlb", "nhl", "ufc", " mls ", "premier league", "champions league",
-    "world cup", "super bowl", "grand prix", " f1 ", "formula 1", "wimbledon", "us open",
-    "playoff", "stanley cup", "world series", "la liga", "serie a", "bundesliga",
-    "heavyweight", " vs. ", " vs ", "match", "tournament", "olympic",
+    "nba",
+    "nfl",
+    "mlb",
+    "nhl",
+    "ufc",
+    " mls ",
+    "premier league",
+    "champions league",
+    "world cup",
+    "super bowl",
+    "grand prix",
+    " f1 ",
+    "formula 1",
+    "wimbledon",
+    "us open",
+    "playoff",
+    "stanley cup",
+    "world series",
+    "la liga",
+    "serie a",
+    "bundesliga",
+    "heavyweight",
+    " vs. ",
+    " vs ",
+    "match",
+    "tournament",
+    "olympic",
 ];
 
 const ECONOMICS_KEYWORDS: &[&str] = &[
-    "fed ", "fomc", "rate cut", "rate hike", "interest rate", "cpi", "inflation", "gdp",
-    "unemployment", "jobs report", "nonfarm", "recession", "treasury yield", "earnings",
-    "ipo", "s&p 500", "nasdaq", "stock price",
+    "fed ",
+    "fomc",
+    "rate cut",
+    "rate hike",
+    "interest rate",
+    "cpi",
+    "inflation",
+    "gdp",
+    "unemployment",
+    "jobs report",
+    "nonfarm",
+    "recession",
+    "treasury yield",
+    "earnings",
+    "ipo",
+    "s&p 500",
+    "nasdaq",
+    "stock price",
 ];
 
 const WEATHER_KEYWORDS: &[&str] = &[
-    "temperature", "hurricane", "rainfall", "snowfall", "weather", "highest temp",
-    "degrees fahrenheit", "degrees celsius", "tropical storm", "heat wave",
+    "temperature",
+    "hurricane",
+    "rainfall",
+    "snowfall",
+    "weather",
+    "highest temp",
+    "degrees fahrenheit",
+    "degrees celsius",
+    "tropical storm",
+    "heat wave",
 ];
 
 const GEOPOLITICS_KEYWORDS: &[&str] = &[
-    "ceasefire", "invasion", "invade", "missile", "airstrike", "nato", "nuclear weapon",
-    "sanction", "ukraine", "gaza", "israel", "iran", "taiwan", "war ", "hostage",
-    "hormuz", "peace deal", "blockade", "troops",
+    "ceasefire",
+    "invasion",
+    "invade",
+    "missile",
+    "airstrike",
+    "nato",
+    "nuclear weapon",
+    "sanction",
+    "ukraine",
+    "gaza",
+    "israel",
+    "iran",
+    "taiwan",
+    "war ",
+    "hostage",
+    "hormuz",
+    "peace deal",
+    "blockade",
+    "troops",
 ];
 
 const POLITICS_KEYWORDS: &[&str] = &[
-    "election", "president", "presidential", "senate", "congress", "governor", "trump",
-    "biden", "nominee", "nomination", "impeach", "parliament", "prime minister", "cabinet",
-    "supreme court", "mayor", "ballot", "primary", "approval rating", "executive order",
-    "white house", "democrat", "republican",
+    "election",
+    "president",
+    "presidential",
+    "senate",
+    "congress",
+    "governor",
+    "trump",
+    "biden",
+    "nominee",
+    "nomination",
+    "impeach",
+    "parliament",
+    "prime minister",
+    "cabinet",
+    "supreme court",
+    "mayor",
+    "ballot",
+    "primary",
+    "approval rating",
+    "executive order",
+    "white house",
+    "democrat",
+    "republican",
 ];
 
 const CULTURE_KEYWORDS: &[&str] = &[
-    "oscar", "grammy", "emmy", "album", "box office", "movie", "billboard", "taylor swift",
-    "kanye", "mrbeast", "tiktok", "spotify", "person of the year", "celebrity", "rotten tomatoes",
-    "netflix", "song",
+    "oscar",
+    "grammy",
+    "emmy",
+    "album",
+    "box office",
+    "movie",
+    "billboard",
+    "taylor swift",
+    "kanye",
+    "mrbeast",
+    "tiktok",
+    "spotify",
+    "person of the year",
+    "celebrity",
+    "rotten tomatoes",
+    "netflix",
+    "song",
 ];
 
 fn matches_any(haystack: &str, keywords: &[&str]) -> bool {
@@ -217,6 +325,7 @@ mod tests {
             venue: Venue::PolymarketInternational,
             event_id: None,
             market_id: "m1".to_string(),
+            condition_id: None,
             slug: String::new(),
             question: question.to_string(),
             resolution_rules: rules.map(str::to_string),
@@ -238,7 +347,10 @@ mod tests {
     #[test]
     fn classifies_structured_domains() {
         assert_eq!(
-            classify(&market("Will Bitcoin close above $100,000 on June 30?", None)),
+            classify(&market(
+                "Will Bitcoin close above $100,000 on June 30?",
+                None
+            )),
             MarketCategory::Crypto
         );
         assert_eq!(
@@ -250,7 +362,10 @@ mod tests {
             MarketCategory::Economics
         );
         assert_eq!(
-            classify(&market("Highest temperature in NYC on Friday above 90?", None)),
+            classify(&market(
+                "Highest temperature in NYC on Friday above 90?",
+                None
+            )),
             MarketCategory::Weather
         );
     }
@@ -266,7 +381,10 @@ mod tests {
             MarketCategory::Geopolitics
         );
         assert_eq!(
-            classify(&market("Will Taylor Swift release an album this year?", None)),
+            classify(&market(
+                "Will Taylor Swift release an album this year?",
+                None
+            )),
             MarketCategory::Culture
         );
     }

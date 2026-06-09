@@ -95,5 +95,6 @@ fn build_report(db_path: &str) -> anyhow::Result<serde_json::Value> {
         "equity_curve": equity_curve,
         "recent_orders": ledger.recent_orders(50)?,
         "recent_forecasts": ledger.recent_forecasts(50)?,
+        "recent_settlements": ledger.recent_settlements(50)?,
     }))
 }

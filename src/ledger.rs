@@ -3,7 +3,8 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 
 use crate::types::{
-    ExecutionMode, Fill, Forecast, Market, NewOrder, OrderBook, OrderStatus, Venue,
+    ExecutionMode, Fill, Forecast, Market, MarketResolution, NewOrder, OrderBook, OrderStatus,
+    Venue,
 };
 
 pub struct Ledger {
@@ -42,6 +43,17 @@ pub struct ForecastHistoryRow {
     pub model_version: String,
     pub market_price_seen: Option<f64>,
     pub do_not_trade_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SettlementRow {
+    pub settled_at: String,
+    pub question: String,
+    pub outcome: String,
+    pub shares: f64,
+    pub payout: f64,
+    pub cost_basis: f64,
+    pub realized_pnl: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,10 +172,66 @@ impl Ledger {
                     mtm_mid REAL NOT NULL,
                     open_positions INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS market_resolutions(
+                    venue TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL,
+                    payout_yes REAL NOT NULL,
+                    payout_no REAL NOT NULL,
+                    resolution_source TEXT NOT NULL,
+                    raw_resolution_json TEXT NOT NULL,
+                    PRIMARY KEY (venue, market_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS settlements(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT NOT NULL,
+                    token_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    shares REAL NOT NULL,
+                    payout REAL NOT NULL,
+                    cost_basis REAL NOT NULL,
+                    realized_pnl REAL NOT NULL,
+                    settled_at TEXT NOT NULL
+                );
                 "#,
             )
             .context("creating ledger schema")?;
-        Ok(Self { connection })
+        let ledger = Self { connection };
+        ledger.migrate()?;
+        Ok(ledger)
+    }
+
+    /// Additive migrations for databases created before a column existed.
+    fn migrate(&self) -> anyhow::Result<()> {
+        self.add_column_if_missing("markets", "condition_id", "TEXT")?;
+        self.add_column_if_missing("orderbook_snapshots", "condition_id", "TEXT")?;
+        self.add_column_if_missing("orderbook_snapshots", "exchange_ts", "TEXT")?;
+        self.add_column_if_missing("orderbook_snapshots", "book_hash", "TEXT")?;
+        self.add_column_if_missing("orderbook_snapshots", "neg_risk", "INTEGER")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        declaration: &str,
+    ) -> anyhow::Result<()> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let existing: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        if !existing.iter().any(|name| name == column) {
+            self.connection.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn ensure_account(&self, starting_cash: f64) -> anyhow::Result<()> {
@@ -178,12 +246,13 @@ impl Ledger {
         self.connection.execute(
             r#"
             INSERT INTO markets(
-                venue, event_id, market_id, slug, question, resolution_rules,
+                venue, event_id, market_id, condition_id, slug, question, resolution_rules,
                 close_time, active, closed, neg_risk, yes_token_id, no_token_id,
                 volume_24hr, liquidity, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(venue, market_id) DO UPDATE SET
                 event_id = excluded.event_id,
+                condition_id = excluded.condition_id,
                 slug = excluded.slug,
                 question = excluded.question,
                 resolution_rules = excluded.resolution_rules,
@@ -201,6 +270,7 @@ impl Ledger {
                 market.venue.as_str(),
                 market.event_id,
                 market.market_id,
+                market.condition_id,
                 market.slug,
                 market.question,
                 market.resolution_rules,
@@ -228,8 +298,9 @@ impl Ledger {
         self.connection.execute(
             r#"
             INSERT INTO orderbook_snapshots(
-                ts, venue, market_id, token_id, best_bid, best_ask, spread, midpoint, raw_book_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ts, venue, market_id, token_id, best_bid, best_ask, spread, midpoint,
+                condition_id, exchange_ts, book_hash, neg_risk, raw_book_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 book.ts.to_rfc3339(),
@@ -240,6 +311,10 @@ impl Ledger {
                 book.best_ask(),
                 book.spread(),
                 book.midpoint(),
+                book.condition_id,
+                book.exchange_ts.map(|ts| ts.to_rfc3339()),
+                book.hash,
+                book.neg_risk,
                 raw,
             ],
         )?;
@@ -369,7 +444,7 @@ impl Ledger {
     pub fn markets_with_tokens(&self, limit: usize) -> anyhow::Result<Vec<Market>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT venue, event_id, market_id, slug, question, resolution_rules,
+            SELECT venue, event_id, market_id, condition_id, slug, question, resolution_rules,
                    close_time, active, closed, neg_risk, yes_token_id, no_token_id,
                    volume_24hr, liquidity
             FROM markets
@@ -380,7 +455,7 @@ impl Ledger {
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
             let venue_raw: String = row.get(0)?;
-            let close_time_raw: Option<String> = row.get(6)?;
+            let close_time_raw: Option<String> = row.get(7)?;
             Ok(Market {
                 venue: if venue_raw == "polymarket_us" {
                     Venue::PolymarketUs
@@ -389,20 +464,21 @@ impl Ledger {
                 },
                 event_id: row.get(1)?,
                 market_id: row.get(2)?,
-                slug: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                question: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                resolution_rules: row.get(5)?,
+                condition_id: row.get(3)?,
+                slug: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                question: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                resolution_rules: row.get(6)?,
                 close_time: close_time_raw
                     .as_deref()
                     .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                     .map(|parsed| parsed.with_timezone(&Utc)),
-                active: row.get(7)?,
-                closed: row.get(8)?,
-                neg_risk: row.get(9)?,
-                yes_token_id: row.get(10)?,
-                no_token_id: row.get(11)?,
-                volume_24hr: row.get(12)?,
-                liquidity: row.get(13)?,
+                active: row.get(8)?,
+                closed: row.get(9)?,
+                neg_risk: row.get(10)?,
+                yes_token_id: row.get(11)?,
+                no_token_id: row.get(12)?,
+                volume_24hr: row.get(13)?,
+                liquidity: row.get(14)?,
             })
         })?;
         let mut markets = Vec::new();
@@ -523,10 +599,7 @@ impl Ledger {
                 summary.open_positions.len() as i64,
             ],
         )?;
-        Ok((
-            summary.cash + mtm_liquidation,
-            summary.cash + mtm_mid,
-        ))
+        Ok((summary.cash + mtm_liquidation, summary.cash + mtm_mid))
     }
 
     pub fn equity_curve(&self, limit: usize) -> anyhow::Result<Vec<(String, f64, f64, i64)>> {
@@ -634,6 +707,142 @@ impl Ledger {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Market IDs that currently have open positions and no stored
+    /// resolution; these are the markets worth polling for settlement.
+    pub fn unsettled_position_markets(&self) -> anyhow::Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT DISTINCT p.market_id FROM positions p
+            WHERE p.shares > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM market_resolutions r WHERE r.market_id = p.market_id
+              )
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut market_ids = Vec::new();
+        for row in rows {
+            market_ids.push(row?);
+        }
+        Ok(market_ids)
+    }
+
+    /// Record a resolution and settle all open positions in that market:
+    /// pay out shares at the resolved per-share value, realize PnL against
+    /// cost basis, and close the positions. Returns settled (payout, pnl)
+    /// totals.
+    pub fn settle_market(&self, resolution: &MarketResolution) -> anyhow::Result<(f64, f64)> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let raw = serde_json::to_string(&resolution.raw).context("serializing resolution json")?;
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            r#"
+            INSERT OR IGNORE INTO market_resolutions(
+                venue, market_id, resolved_at, payout_yes, payout_no,
+                resolution_source, raw_resolution_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                resolution.venue.as_str(),
+                resolution.market_id,
+                now,
+                resolution.payout_yes,
+                resolution.payout_no,
+                resolution.resolution_source,
+                raw,
+            ],
+        )?;
+
+        let positions: Vec<PositionRow> = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT market_id, token_id, outcome, shares, cost_basis
+                FROM positions WHERE market_id = ?1 AND shares > 0
+                "#,
+            )?;
+            let rows = statement.query_map(params![resolution.market_id], |row| {
+                Ok(PositionRow {
+                    market_id: row.get(0)?,
+                    token_id: row.get(1)?,
+                    outcome: row.get(2)?,
+                    shares: row.get(3)?,
+                    cost_basis: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+
+        let mut total_payout = 0.0;
+        let mut total_pnl = 0.0;
+        for position in &positions {
+            let payout_per_share = if position.outcome == "yes" {
+                resolution.payout_yes
+            } else {
+                resolution.payout_no
+            };
+            let payout = position.shares * payout_per_share;
+            let realized_pnl = payout - position.cost_basis;
+            transaction.execute(
+                r#"
+                INSERT INTO settlements(
+                    market_id, token_id, outcome, shares, payout,
+                    cost_basis, realized_pnl, settled_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    position.market_id,
+                    position.token_id,
+                    position.outcome,
+                    position.shares,
+                    payout,
+                    position.cost_basis,
+                    realized_pnl,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM positions WHERE market_id = ?1 AND token_id = ?2",
+                params![position.market_id, position.token_id],
+            )?;
+            total_payout += payout;
+            total_pnl += realized_pnl;
+        }
+        transaction.execute(
+            "UPDATE account SET cash = cash + ?1, realized_pnl = realized_pnl + ?2 WHERE id = 1",
+            params![total_payout, total_pnl],
+        )?;
+        transaction.commit()?;
+        Ok((total_payout, total_pnl))
+    }
+
+    pub fn recent_settlements(&self, limit: usize) -> anyhow::Result<Vec<SettlementRow>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT s.settled_at, COALESCE(m.question, s.market_id), s.outcome,
+                   s.shares, s.payout, s.cost_basis, s.realized_pnl
+            FROM settlements s
+            LEFT JOIN markets m ON m.market_id = s.market_id
+            ORDER BY s.id DESC LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(SettlementRow {
+                settled_at: row.get(0)?,
+                question: row.get(1)?,
+                outcome: row.get(2)?,
+                shares: row.get(3)?,
+                payout: row.get(4)?,
+                cost_basis: row.get(5)?,
+                realized_pnl: row.get(6)?,
+            })
+        })?;
+        let mut settlements = Vec::new();
+        for row in rows {
+            settlements.push(row?);
+        }
+        Ok(settlements)
     }
 
     pub fn latest_snapshot_quote(&self, token_id: &str) -> anyhow::Result<Option<(f64, f64)>> {
