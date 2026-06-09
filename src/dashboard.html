@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>poly-agent dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #21262d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --amber: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px;
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; font-weight: 600; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  #status { font-size: 13px; color: var(--muted); }
+  #status .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  #status.stale .dot { background: var(--red); animation: none; }
+  @keyframes pulse { 50% { opacity: 0.4; } }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .card .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .value.pos { color: var(--green); }
+  .card .value.neg { color: var(--red); }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  .panel h2 {
+    font-size: 14px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px;
+  }
+  .chart-wrap { height: 280px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; color: var(--muted); font-weight: 500;
+    padding: 6px 10px; border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td {
+    padding: 7px 10px; border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.q { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .num { text-align: right; }
+  .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+  }
+  .tag.yes { background: rgba(63,185,80,.15); color: var(--green); }
+  .tag.no { background: rgba(248,81,73,.15); color: var(--red); }
+  .tag.filled { background: rgba(63,185,80,.15); color: var(--green); }
+  .tag.rejected { background: rgba(248,81,73,.15); color: var(--red); }
+  .tag.partially_filled { background: rgba(210,153,34,.15); color: var(--amber); }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 10px; }
+  .edge-pos { color: var(--green); }
+  .edge-neg { color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>poly-agent <span>paper trading dashboard</span></h1>
+  <div id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+</header>
+
+<div class="cards" id="cards"></div>
+
+<div class="panel">
+  <h2>Equity</h2>
+  <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+</div>
+
+<div class="panel">
+  <h2>Open positions</h2>
+  <div id="positions"></div>
+</div>
+
+<div class="panel">
+  <h2>Recent forecasts</h2>
+  <div id="forecasts"></div>
+</div>
+
+<div class="panel">
+  <h2>Recent orders</h2>
+  <div id="orders"></div>
+</div>
+
+<script>
+const fmt = (x, digits = 2) =>
+  x === null || x === undefined ? '—' : Number(x).toFixed(digits);
+const fmtTime = ts => ts ? ts.replace('T', ' ').slice(0, 19) : '—';
+const esc = s => String(s ?? '').replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let chart = null;
+let lastUpdate = null;
+
+function card(label, value, cls = '') {
+  return `<div class="card"><div class="label">${label}</div>
+    <div class="value ${cls}">${value}</div></div>`;
+}
+
+function renderCards(data) {
+  const a = data.account;
+  const start = data.equity_curve.length ? data.equity_curve[0].liquidation : a.equity_liquidation;
+  const pnl = a.equity_liquidation - start;
+  const pnlCls = pnl > 0.005 ? 'pos' : pnl < -0.005 ? 'neg' : '';
+  document.getElementById('cards').innerHTML =
+    card('Equity (liquidation)', fmt(a.equity_liquidation)) +
+    card('Equity (midpoint)', fmt(a.equity_midpoint)) +
+    card('Session PnL (liq)', (pnl >= 0 ? '+' : '') + fmt(pnl), pnlCls) +
+    card('Cash', fmt(a.cash)) +
+    card('Fees paid', fmt(a.total_fees)) +
+    card('Orders', `${data.orders.filled} <span class="muted" style="font-size:14px">/ ${data.orders.rejected} rej</span>`);
+}
+
+function renderChart(curve) {
+  const labels = curve.map(p => fmtTime(p.ts).slice(11));
+  const liq = curve.map(p => p.liquidation);
+  const mid = curve.map(p => p.midpoint);
+  if (!chart) {
+    chart = new Chart(document.getElementById('equity-chart'), {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'Liquidation', data: liq, borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,.08)', fill: true, tension: .25,
+          pointRadius: 0, borderWidth: 2 },
+        { label: 'Midpoint', data: mid, borderColor: '#8b949e',
+          borderDash: [5, 4], fill: false, tension: .25,
+          pointRadius: 0, borderWidth: 1.5 },
+      ]},
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { color: '#8b949e', boxWidth: 18 } } },
+        scales: {
+          x: { ticks: { color: '#8b949e', maxTicksLimit: 12 },
+               grid: { color: '#21262d' } },
+          y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
+        },
+      },
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = liq;
+    chart.data.datasets[1].data = mid;
+    chart.update('none');
+  }
+}
+
+function renderPositions(positions) {
+  const el = document.getElementById('positions');
+  if (!positions.length) {
+    el.innerHTML = '<div class="empty">No open positions.</div>';
+    return;
+  }
+  const rows = positions.map(p => {
+    const avg = p.shares ? p.cost_basis / p.shares : null;
+    const pnl = p.liquidation_value !== null ? p.liquidation_value - p.cost_basis : null;
+    const cls = pnl === null ? '' : pnl >= 0 ? 'edge-pos' : 'edge-neg';
+    return `<tr>
+      <td class="q" title="${esc(p.question)}">${esc(p.question ?? p.market_id)}</td>
+      <td><span class="tag ${esc(p.outcome)}">${esc(p.outcome).toUpperCase()}</span></td>
+      <td class="num">${fmt(p.shares, 0)}</td>
+      <td class="num">${fmt(avg, 3)}</td>
+      <td class="num">${fmt(p.best_bid, 3)}</td>
+      <td class="num">${fmt(p.cost_basis)}</td>
+      <td class="num">${fmt(p.liquidation_value)}</td>
+      <td class="num ${cls}">${pnl === null ? '—' : (pnl >= 0 ? '+' : '') + fmt(pnl)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Market</th><th>Side</th><th class="num">Shares</th><th class="num">Avg px</th>
+    <th class="num">Bid</th><th class="num">Cost</th><th class="num">Liq value</th>
+    <th class="num">Unrealized</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderForecasts(forecasts) {
+  const el = document.getElementById('forecasts');
+  if (!forecasts.length) {
+    el.innerHTML = '<div class="empty">No forecasts yet.</div>';
+    return;
+  }
+  const rows = forecasts.map(f => {
+    const edge = f.market_price_seen !== null ? f.fair_prob_yes - f.market_price_seen : null;
+    const cls = edge === null ? '' : edge >= 0 ? 'edge-pos' : 'edge-neg';
+    return `<tr>
+      <td class="muted">${fmtTime(f.ts)}</td>
+      <td class="q" title="${esc(f.question)}">${esc(f.question)}</td>
+      <td class="num">${fmt(f.fair_prob_yes, 3)}</td>
+      <td class="num">${fmt(f.market_price_seen, 3)}</td>
+      <td class="num ${cls}">${edge === null ? '—' : (edge >= 0 ? '+' : '') + fmt(edge, 3)}</td>
+      <td class="num">${fmt(f.confidence, 2)}</td>
+      <td class="muted">${esc(f.do_not_trade_reason ?? '')}</td>
+      <td class="muted">${esc(f.model_version)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Time</th><th>Market</th><th class="num">P(yes)</th><th class="num">Market</th>
+    <th class="num">Raw edge</th><th class="num">Conf</th><th>Do-not-trade</th><th>Model</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderOrders(orders) {
+  const el = document.getElementById('orders');
+  if (!orders.length) {
+    el.innerHTML = '<div class="empty">No orders yet.</div>';
+    return;
+  }
+  const rows = orders.map(o => `<tr>
+    <td class="muted">${fmtTime(o.ts)}</td>
+    <td class="q" title="${esc(o.question)}">${esc(o.question)}</td>
+    <td><span class="tag ${esc(o.outcome)}">${esc(o.outcome).toUpperCase()}</span></td>
+    <td>${esc(o.side)}</td>
+    <td class="num">${fmt(o.size, 0)}</td>
+    <td class="num">${fmt(o.limit_price, 3)}</td>
+    <td class="num">${o.status === 'rejected' ? '—' : fmt(o.cost)}</td>
+    <td><span class="tag ${esc(o.status)}">${esc(o.status)}</span></td>
+    <td class="muted">${esc(o.reject_reason ?? '')}</td>
+  </tr>`).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Time</th><th>Market</th><th>Side</th><th>Action</th><th class="num">Size</th>
+    <th class="num">Limit</th><th class="num">Cost</th><th>Status</th><th>Reason</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function refresh() {
+  const status = document.getElementById('status');
+  const statusText = document.getElementById('status-text');
+  try {
+    const response = await fetch('/api/report');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    renderCards(data);
+    renderChart(data.equity_curve);
+    renderPositions(data.positions);
+    renderForecasts(data.recent_forecasts);
+    renderOrders(data.recent_orders);
+    lastUpdate = new Date();
+    status.classList.remove('stale');
+  } catch (error) {
+    status.classList.add('stale');
+    statusText.textContent = `error: ${error.message}`;
+    return;
+  }
+  statusText.textContent = `live · updated ${lastUpdate.toLocaleTimeString()}`;
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

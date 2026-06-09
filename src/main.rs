@@ -4,6 +4,7 @@ mod forecast;
 mod ledger;
 mod llm;
 mod policy;
+mod server;
 mod types;
 
 use clap::{Parser, Subcommand};
@@ -62,6 +63,11 @@ enum Command {
     },
     /// Show paper account state: cash, fees, open positions, marked equity.
     Report,
+    /// Serve a live web dashboard for reviewing results in realtime.
+    Serve {
+        #[arg(long, default_value_t = 8420)]
+        port: u16,
+    },
     /// Run the full simulation loop for several hours using Codex forecasts:
     /// discover -> snapshot -> LLM forecast -> paper trade -> equity snapshot.
     Run {
@@ -119,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         } => run_forecast(&ledger, &exchange, market_id, prob, limit).await,
         Command::Trade { limit, min_edge } => trade(&ledger, &exchange, limit, min_edge).await,
         Command::Report => report(&ledger),
+        Command::Serve { port } => server::serve(cli.db.clone(), port).await,
         Command::Run {
             hours,
             cycle_minutes,

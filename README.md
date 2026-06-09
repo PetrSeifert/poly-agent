@@ -89,6 +89,23 @@ Notes:
   equity curve (liquidation- and midpoint-marked) accumulates one point per
   cycle in `equity_snapshots`.
 
+## Web dashboard
+
+For realtime review during a run, serve the dashboard from a second terminal
+against the same database:
+
+```bash
+cargo run --release -- serve            # http://127.0.0.1:8420
+cargo run --release -- serve --port 9000
+```
+
+It auto-refreshes every 3 seconds and shows the equity curve (liquidation and
+midpoint marks), account cards with session PnL, open positions with
+unrealized PnL, recent forecasts (model probability vs market, confidence,
+do-not-trade reasons), and recent orders with fills and rejection reasons.
+The ledger runs in WAL mode, so the server reads safely while a simulation
+writes from another process.
+
 State lives in `ledger.db` by default (`--db` to override); the starting paper
 bankroll is set on first run (`--starting-cash`, default 1000).
 

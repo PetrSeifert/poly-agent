@@ -19,6 +19,31 @@ pub struct PositionRow {
     pub cost_basis: f64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrderHistoryRow {
+    pub ts: String,
+    pub question: String,
+    pub outcome: String,
+    pub side: String,
+    pub order_type: String,
+    pub limit_price: f64,
+    pub size: f64,
+    pub status: String,
+    pub reject_reason: Option<String>,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForecastHistoryRow {
+    pub ts: String,
+    pub question: String,
+    pub fair_prob_yes: f64,
+    pub confidence: f64,
+    pub model_version: String,
+    pub market_price_seen: Option<f64>,
+    pub do_not_trade_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AccountSummary {
     pub cash: f64,
@@ -30,6 +55,14 @@ pub struct AccountSummary {
 impl Ledger {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let connection = Connection::open(path).context("opening ledger database")?;
+        // WAL allows the dashboard server to read while a simulation run is
+        // writing from another process.
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .context("enabling WAL")?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .context("setting busy timeout")?;
         connection
             .execute_batch(
                 r#"
@@ -516,6 +549,81 @@ impl Ledger {
             |row| row.get(0),
         )?;
         Ok((filled, rejected))
+    }
+
+    pub fn recent_orders(&self, limit: usize) -> anyhow::Result<Vec<OrderHistoryRow>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT o.ts, COALESCE(m.question, o.market_id), o.outcome, o.side,
+                   o.order_type, o.limit_price, o.size, o.status, o.reject_reason,
+                   COALESCE((SELECT SUM(f.price * f.size + f.fee) FROM fills f WHERE f.order_id = o.id), 0)
+            FROM orders o
+            LEFT JOIN markets m ON m.market_id = o.market_id
+            ORDER BY o.id DESC LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(OrderHistoryRow {
+                ts: row.get(0)?,
+                question: row.get(1)?,
+                outcome: row.get(2)?,
+                side: row.get(3)?,
+                order_type: row.get(4)?,
+                limit_price: row.get(5)?,
+                size: row.get(6)?,
+                status: row.get(7)?,
+                reject_reason: row.get(8)?,
+                cost: row.get(9)?,
+            })
+        })?;
+        let mut orders = Vec::new();
+        for row in rows {
+            orders.push(row?);
+        }
+        Ok(orders)
+    }
+
+    pub fn recent_forecasts(&self, limit: usize) -> anyhow::Result<Vec<ForecastHistoryRow>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT f.ts, COALESCE(m.question, f.market_id), f.fair_prob_yes, f.confidence,
+                   f.model_version,
+                   CAST(json_extract(f.rationale_json, '$.market_price_seen') AS REAL),
+                   json_extract(f.rationale_json, '$.do_not_trade_reason')
+            FROM forecasts f
+            LEFT JOIN markets m ON m.market_id = f.market_id
+            ORDER BY f.id DESC LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(ForecastHistoryRow {
+                ts: row.get(0)?,
+                question: row.get(1)?,
+                fair_prob_yes: row.get(2)?,
+                confidence: row.get(3)?,
+                model_version: row.get(4)?,
+                market_price_seen: row.get(5)?,
+                do_not_trade_reason: row.get(6)?,
+            })
+        })?;
+        let mut forecasts = Vec::new();
+        for row in rows {
+            forecasts.push(row?);
+        }
+        Ok(forecasts)
+    }
+
+    pub fn market_question(&self, market_id: &str) -> anyhow::Result<Option<String>> {
+        let result = self.connection.query_row(
+            "SELECT question FROM markets WHERE market_id = ?1",
+            params![market_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(question) => Ok(Some(question)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn latest_snapshot_quote(&self, token_id: &str) -> anyhow::Result<Option<(f64, f64)>> {
