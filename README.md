@@ -1,14 +1,23 @@
 # poly-agent
 
 A paper-trading agent for Polymarket prediction markets, implementing the first
-build target from `RESEARCH.md`. Read-only against public APIs; no live
+build target from `IMPLEMENTATION_RESEARCH.md`. Read-only against public APIs; no live
 execution, no keys, no authentication.
 
 ## Components
 
 - **Exchange adapter** (`src/exchange.rs`): `ExchangeAdapter` trait plus a
   read-only Polymarket International implementation (Gamma API for market
-  discovery, CLOB API for orderbooks).
+  discovery with offset pagination, CLOB API for orderbooks).
+- **Triage** (`src/triage.rs`): implements the edge-preference ranking from
+  `MARKET_AGENT_RESEARCH.md`. Classifies each market into a domain by keyword
+  (crypto, sports, economics, weather, politics, geopolitics, culture, other)
+  and derives a profile: structured-data domains get full forecast trust,
+  "other" needs 1.5x the minimum edge at reduced trust, and narrative-heavy
+  domains (politics, geopolitics, culture) are blocked outright. Missing
+  resolution rules make a market untradeable; thin rules raise the required
+  edge. An opportunity score (category prior, liquidity, spread tightness,
+  forecast staleness) ranks markets for the scarce LLM forecast budget.
 - **Ledger** (`src/ledger.rs`): SQLite schema for markets, orderbook
   snapshots, forecasts, orders, fills, positions, and the paper account.
 - **Paper broker** (`src/broker.rs`): simulates marketable orders by walking
@@ -16,9 +25,11 @@ execution, no keys, no authentication.
   taker fee model, tracks slippage, and rejects orders the book cannot satisfy
   within the limit price or below market minimum size.
 - **Trading policy** (`src/policy.rs`): deterministic gate — trades only when
-  post-fee edge exceeds a threshold, with spread, time-to-close, and
-  per-market position-size limits. Shrinks forecasts toward the market price
-  (`p = w * p_agent + (1 - w) * p_market`).
+  post-fee edge exceeds a threshold (scaled by the triage category and rules
+  clarity), with spread, time-to-close, and per-market position-size limits.
+  Shrinks forecasts toward the market price
+  (`p = w * p_agent + (1 - w) * p_market`), where `w` includes both the
+  model's confidence and the triage trust factor for the domain.
 - **Forecast stub** (`src/forecast.rs`): market-anchored or manual
   probabilities, useful for testing the accounting pipeline.
 - **LLM forecaster** (`src/llm.rs`): shells out to the Codex CLI
@@ -33,10 +44,10 @@ execution, no keys, no authentication.
 ```bash
 cargo build
 
-# 1. Fetch active markets (sorted by 24h volume)
-cargo run -- discover --limit 50
+# 1. Fetch active markets (sorted by 24h volume, paginated)
+cargo run -- discover --limit 200
 
-# 2. Record orderbook snapshots
+# 2. Record orderbook snapshots for the tradeable universe
 cargo run -- record --limit 20
 
 # 3. Generate forecasts (market-anchored stub, or manual for one market)
@@ -49,6 +60,12 @@ cargo run -- trade --limit 20 --min-edge 0.05
 # 5. Account state: cash, positions, equity curve, order counts
 cargo run -- report
 ```
+
+`record` and `trade` operate on the *tradeable universe*, not the raw
+top-volume list: discovery digs 10x deeper than the universe size, then triage
+drops avoided categories and rule-less markets and caps near-duplicate
+outcomes of the same event (e.g. dozens of "will X win the World Cup" markets)
+at 3 slots, so one big event cannot crowd out everything else.
 
 ## Multi-hour LLM simulation
 
@@ -76,9 +93,11 @@ Notes:
 
 - Codex forecasts run concurrently (one `codex exec` process each), so a
   batch costs roughly one forecast's latency (30–90s). `--max-llm-calls`
-  caps calls (and thus concurrent processes) per cycle; stale forecasts are
-  refreshed first, and markets closing within the policy's minimum
-  time-to-close are never sent to the LLM.
+  caps calls (and thus concurrent processes) per cycle. The budget goes to
+  the highest opportunity-score markets among those with stale forecasts
+  (only real Codex forecasts count toward freshness, not stubs). Markets
+  closing within the policy's minimum time-to-close, and books priced
+  outside 0.05–0.95 (no achievable taker edge), are never sent to the LLM.
 - `--model` overrides the Codex model and `--reasoning-effort` the thinking
   level (`minimal|low|medium|high|xhigh`, default `medium`). On a
   ChatGPT-subscription login,
@@ -113,7 +132,7 @@ bankroll is set on first run (`--starting-cash`, default 1000).
 
 ## Not yet implemented
 
-Per the staged-mode plan in `RESEARCH.md`: settlement against official
+Per the staged-mode plan in `IMPLEMENTATION_RESEARCH.md`: settlement against official
 resolution data, limit-order queue simulation, WebSocket streaming,
 calibration/evaluation reports, the LLM research layer, and any live adapter.
 `ExecutionMode` already enumerates the live modes so enabling them later is an

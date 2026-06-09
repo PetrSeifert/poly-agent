@@ -144,25 +144,38 @@ impl ExchangeAdapter for PolymarketIntl {
     }
 
     async fn discover_markets(&self, filter: &MarketFilter) -> anyhow::Result<Vec<Market>> {
+        // Gamma caps page size at 100, so paginate with offset.
+        const PAGE_SIZE: usize = 100;
         let limit = filter.limit.clamp(1, 500);
-        let mut url = format!(
-            "{}/markets?limit={}&order=volume24hr&ascending=false",
-            self.gamma_base, limit
-        );
-        if filter.active_only {
-            url.push_str("&active=true&closed=false");
+        let mut markets = Vec::new();
+        while markets.len() < limit {
+            let page_limit = (limit - markets.len()).min(PAGE_SIZE);
+            let mut url = format!(
+                "{}/markets?limit={}&offset={}&order=volume24hr&ascending=false",
+                self.gamma_base,
+                page_limit,
+                markets.len()
+            );
+            if filter.active_only {
+                url.push_str("&active=true&closed=false");
+            }
+            let response = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .context("requesting gamma markets")?;
+            if !response.status().is_success() {
+                return Err(anyhow!("gamma markets returned {}", response.status()));
+            }
+            let raw: Vec<GammaMarket> = response.json().await.context("decoding gamma markets")?;
+            let page_count = raw.len();
+            markets.extend(raw.into_iter().map(GammaMarket::into_market));
+            if page_count < page_limit {
+                break;
+            }
         }
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("requesting gamma markets")?;
-        if !response.status().is_success() {
-            return Err(anyhow!("gamma markets returned {}", response.status()));
-        }
-        let raw: Vec<GammaMarket> = response.json().await.context("decoding gamma markets")?;
-        Ok(raw.into_iter().map(GammaMarket::into_market).collect())
+        Ok(markets)
     }
 
     async fn get_orderbook(&self, token_id: &str) -> anyhow::Result<OrderBook> {

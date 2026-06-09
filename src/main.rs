@@ -5,6 +5,7 @@ mod ledger;
 mod llm;
 mod policy;
 mod server;
+mod triage;
 mod types;
 
 use clap::{Parser, Subcommand};
@@ -35,7 +36,7 @@ struct Cli {
 enum Command {
     /// Fetch active markets from Gamma and store metadata in the ledger.
     Discover {
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 200)]
         limit: usize,
     },
     /// Record orderbook snapshots for stored markets.
@@ -117,13 +118,19 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Discover { limit } => discover(&ledger, &exchange, limit).await,
-        Command::Record { limit } => record(&ledger, &exchange, limit).await,
+        Command::Record { limit } => {
+            let universe = select_universe(&ledger, limit)?;
+            record(&ledger, &exchange, &universe).await
+        }
         Command::Forecast {
             market_id,
             prob,
             limit,
         } => run_forecast(&ledger, &exchange, market_id, prob, limit).await,
-        Command::Trade { limit, min_edge } => trade(&ledger, &exchange, limit, min_edge).await,
+        Command::Trade { limit, min_edge } => {
+            let universe = select_universe(&ledger, limit)?;
+            trade(&ledger, &exchange, &universe, min_edge).await
+        }
         Command::Report => report(&ledger),
         Command::Serve { port } => server::serve(cli.db.clone(), port).await,
         Command::Run {
@@ -170,6 +177,45 @@ struct RunConfig {
     min_edge: f64,
 }
 
+/// Multi-outcome events (e.g. "who wins the World Cup") appear as dozens of
+/// near-duplicate markets; cap how many can occupy the tradeable universe.
+const MAX_MARKETS_PER_EVENT: usize = 3;
+/// Discover this many times more markets than the universe size, so the
+/// triage filter has something to choose from beyond the top-volume event.
+const DISCOVERY_DEPTH_FACTOR: usize = 10;
+/// Taker edge is measured in absolute probability points, so books priced
+/// near 0 or 1 cannot clear any meaningful edge threshold. Don't waste
+/// forecast budget on them.
+const MIN_TRADEABLE_MIDPOINT: f64 = 0.05;
+const MAX_TRADEABLE_MIDPOINT: f64 = 0.95;
+
+/// Build the tradeable universe: volume-ordered markets filtered down to
+/// categories where the agent has repeatable edge, with rules text present
+/// and near-duplicate outcomes of the same event capped.
+fn select_universe(ledger: &Ledger, limit: usize) -> anyhow::Result<Vec<types::Market>> {
+    let candidates = ledger.markets_with_tokens(limit * DISCOVERY_DEPTH_FACTOR)?;
+    let mut per_event: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut universe = Vec::new();
+    for market in candidates {
+        let profile = triage::profile(&market);
+        if profile.trade_blocked || profile.forecast_priority <= 0.0 {
+            continue;
+        }
+        if let Some(event_id) = &market.event_id {
+            let count = per_event.entry(event_id.clone()).or_insert(0);
+            if *count >= MAX_MARKETS_PER_EVENT {
+                continue;
+            }
+            *count += 1;
+        }
+        universe.push(market);
+        if universe.len() >= limit {
+            break;
+        }
+    }
+    Ok(universe)
+}
+
 async fn run_simulation(
     ledger: &Ledger,
     exchange: &PolymarketIntl,
@@ -195,39 +241,47 @@ async fn run_simulation(
         let cycle_started = std::time::Instant::now();
         info!(cycle, "cycle start");
 
-        if let Err(error) = discover(ledger, exchange, config.markets).await {
+        if let Err(error) =
+            discover(ledger, exchange, config.markets * DISCOVERY_DEPTH_FACTOR).await
+        {
             error!(%error, "discovery failed, continuing with stored markets");
         }
-        if let Err(error) = record(ledger, exchange, config.markets).await {
+        let universe = select_universe(ledger, config.markets)?;
+        info!(
+            size = universe.len(),
+            "tradeable universe selected (triage-filtered, event-capped)"
+        );
+        if let Err(error) = record(ledger, exchange, &universe).await {
             error!(%error, "snapshot recording failed");
         }
 
         // Forecast the markets with the stalest forecasts first, within budget.
-        let markets = ledger.markets_with_tokens(config.markets)?;
         let min_close = chrono::Utc::now()
             + chrono::Duration::seconds((PolicyConfig::default().min_hours_to_close * 3600.0) as i64);
-        let mut stale: Vec<(chrono::Duration, &types::Market)> = Vec::new();
-        for market in &markets {
+        let mut stale: Vec<(chrono::Duration, &types::Market, triage::TriageProfile)> = Vec::new();
+        for market in &universe {
             // Don't spend LLM calls on markets the policy will reject anyway.
             if let Some(close_time) = market.close_time
                 && close_time < min_close
             {
                 continue;
             }
+            let profile = triage::profile(market);
+            // Stub forecasts (confidence 0) must not satisfy the refresh
+            // window, or the agent never spends its LLM budget.
             let age = ledger
-                .forecast_age(&market.market_id)?
+                .forecast_age(&market.market_id, Some(llm::MODEL_VERSION_PREFIX))?
                 .unwrap_or(chrono::Duration::days(3650));
             if age > refresh_age {
-                stale.push((age, market));
+                stale.push((age, market, profile));
             }
         }
-        stale.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
-        let mut candidates = Vec::new();
-        for (_, market) in &stale {
-            if candidates.len() >= config.max_llm_calls {
-                break;
-            }
+        // Rank candidates by opportunity score so the limited LLM budget goes
+        // to the domains where the agent has the most repeatable edge, not
+        // just to whatever forecast happens to be stalest.
+        let mut scored = Vec::new();
+        for (age, market, profile) in &stale {
             let Some(yes_token) = &market.yes_token_id else {
                 continue;
             };
@@ -238,11 +292,36 @@ async fn run_simulation(
                     continue;
                 }
             };
-            if yes_book.midpoint().is_none() {
+            let Some(midpoint) = yes_book.midpoint() else {
                 warn!(market = %market.slug, "empty book, skipping forecast");
                 continue;
+            };
+            if !(MIN_TRADEABLE_MIDPOINT..=MAX_TRADEABLE_MIDPOINT).contains(&midpoint) {
+                info!(
+                    market = %market.slug,
+                    midpoint = format!("{midpoint:.3}"),
+                    "skipping forecast: price too extreme for taker edge"
+                );
+                continue;
             }
-            candidates.push((*market, yes_book));
+            let age_hours = age.num_minutes() as f64 / 60.0;
+            let score = triage::opportunity_score(profile, market, &yes_book, age_hours);
+            scored.push((score, *market, yes_book));
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let mut candidates = Vec::new();
+        for (score, market, yes_book) in scored {
+            if candidates.len() >= config.max_llm_calls {
+                break;
+            }
+            info!(
+                market = %market.slug,
+                category = triage::classify(market).as_str(),
+                score = format!("{score:.3}"),
+                "selected for forecast"
+            );
+            candidates.push((market, yes_book));
         }
 
         // Each forecast is an independent codex process, so run them all
@@ -278,7 +357,7 @@ async fn run_simulation(
             }
         }
 
-        if let Err(error) = trade(ledger, exchange, config.markets, config.min_edge).await {
+        if let Err(error) = trade(ledger, exchange, &universe, config.min_edge).await {
             error!(%error, "trade pass failed");
         }
 
@@ -336,14 +415,17 @@ async fn discover(
     Ok(())
 }
 
-async fn record(ledger: &Ledger, exchange: &PolymarketIntl, limit: usize) -> anyhow::Result<()> {
-    let markets = ledger.markets_with_tokens(limit)?;
+async fn record(
+    ledger: &Ledger,
+    exchange: &PolymarketIntl,
+    markets: &[types::Market],
+) -> anyhow::Result<()> {
     if markets.is_empty() {
-        warn!("no markets in ledger; run `discover` first");
+        warn!("no markets selected; run `discover` first");
         return Ok(());
     }
     let mut recorded = 0;
-    for market in &markets {
+    for market in markets {
         for token_id in [&market.yes_token_id, &market.no_token_id]
             .into_iter()
             .flatten()
@@ -415,7 +497,7 @@ async fn run_forecast(
 async fn trade(
     ledger: &Ledger,
     exchange: &PolymarketIntl,
-    limit: usize,
+    markets: &[types::Market],
     min_edge: f64,
 ) -> anyhow::Result<()> {
     let policy_config = PolicyConfig {
@@ -428,11 +510,10 @@ async fn trade(
     });
     let mode = ExecutionMode::Paper;
 
-    let markets = ledger.markets_with_tokens(limit)?;
     let bankroll = ledger.cash()?;
     info!(bankroll, markets = markets.len(), "starting paper trading pass");
 
-    for market in &markets {
+    for market in markets {
         let Some(forecast) = ledger.latest_forecast(&market.market_id)? else {
             continue;
         };

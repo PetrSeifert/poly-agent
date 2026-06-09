@@ -6,6 +6,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
+use crate::triage;
 use crate::types::{Forecast, Market, OrderBook};
 
 /// Forecasts via the Codex CLI (`codex exec`), which uses the user's ChatGPT
@@ -160,6 +161,7 @@ fn build_prompt(market: &Market, market_prob: f64) -> String {
         .chars()
         .take(2000)
         .collect::<String>();
+    let category = triage::classify(market);
     format!(
         r#"You are a careful probabilistic forecaster for prediction markets.
 
@@ -168,10 +170,17 @@ Reason from base rates and any knowledge you have. Be calibrated:
 avoid both overconfidence and anchoring blindly on the market price.
 
 Question: {question}
+Detected category: {category}
 Resolution rules: {rules}
 Market closes: {close_time}
 Current date/time: {now}
 Current market-implied probability of YES: {market_prob:.4}
+
+Your edge comes from structured, checkable reasoning: exact arithmetic,
+base rates, reference prices, and strict reading of the resolution rules.
+You do NOT have an edge in rumor-driven narratives. Anchor on quantitative
+inputs for crypto/sports/economics/weather questions; for anything driven by
+breaking news or insider information, prefer not to trade.
 
 If the resolution criteria are ambiguous, or you lack the domain knowledge or
 recent information needed to beat the market, say so via "do_not_trade_reason"
@@ -188,6 +197,7 @@ Respond with ONLY a JSON object (no markdown fences, no other text):
   "do_not_trade_reason": <string or null>
 }}"#,
         question = market.question,
+        category = category.as_str(),
         now = Utc::now().to_rfc3339(),
     )
 }

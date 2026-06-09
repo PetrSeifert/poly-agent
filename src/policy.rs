@@ -1,8 +1,9 @@
 use chrono::Utc;
 
+use crate::triage;
 use crate::types::{Forecast, Market, NewOrder, Outcome, OrderBook, OrderType, Side};
 
-pub const POLICY_VERSION: &str = "taker-edge-v1";
+pub const POLICY_VERSION: &str = "taker-edge-v2-triage";
 
 #[derive(Debug, Clone)]
 pub struct PolicyConfig {
@@ -52,6 +53,17 @@ pub fn evaluate(
     bankroll: f64,
     existing_position_cost: f64,
 ) -> PolicyDecision {
+    let profile = triage::profile(market);
+    if profile.trade_blocked {
+        return no_trade(format!(
+            "category '{}' is on the avoid list (narrative-heavy, no repeatable edge)",
+            profile.category.as_str()
+        ));
+    }
+    if profile.rules_clarity == triage::RulesClarity::Missing {
+        return no_trade("no resolution rules text; clarity gate failed".to_string());
+    }
+
     if let Some(close_time) = market.close_time {
         let hours_left = (close_time - Utc::now()).num_minutes() as f64 / 60.0;
         if hours_left < config.min_hours_to_close {
@@ -76,8 +88,13 @@ pub fn evaluate(
     let market_prob = (best_bid + best_ask) / 2.0;
     // Shrink toward the market until the agent has proven calibration.
     // Scaling by the model's own confidence means a confidence of 0
-    // (e.g. "do not trade") collapses to the market price and produces no edge.
-    let weight = (config.forecast_weight * forecast.confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    // (e.g. "do not trade") collapses to the market price and produces no
+    // edge. The triage trust factor additionally shrinks domains where the
+    // agent has no repeatable advantage.
+    let weight = (config.forecast_weight
+        * profile.forecast_trust
+        * forecast.confidence.clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
     let fair_prob = weight * forecast.fair_prob_yes + (1.0 - weight) * market_prob;
 
     let yes_fee = config.fee_rate * best_ask * (1.0 - best_ask);
@@ -100,10 +117,15 @@ pub fn evaluate(
         (Outcome::No, token, no_price, no_edge)
     };
 
-    if edge < config.min_edge {
+    // Weaker categories and thin rules must clear a higher bar.
+    let required_edge = config.min_edge * profile.min_edge_multiplier;
+    if edge < required_edge {
         return no_trade(format!(
-            "best edge {edge:.4} below minimum {:.4}",
-            config.min_edge
+            "best edge {edge:.4} below minimum {required_edge:.4} (base {:.4} x {:.2} for category '{}', rules {:?})",
+            config.min_edge,
+            profile.min_edge_multiplier,
+            profile.category.as_str(),
+            profile.rules_clarity,
         ));
     }
 

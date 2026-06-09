@@ -469,11 +469,21 @@ impl Ledger {
         })
     }
 
-    /// Age of the newest forecast for a market, if any.
-    pub fn forecast_age(&self, market_id: &str) -> anyhow::Result<Option<chrono::Duration>> {
+    /// Age of the newest forecast for a market, optionally restricted to a
+    /// model-version prefix (e.g. only real LLM forecasts, ignoring stubs).
+    pub fn forecast_age(
+        &self,
+        market_id: &str,
+        model_version_prefix: Option<&str>,
+    ) -> anyhow::Result<Option<chrono::Duration>> {
         let result: Result<String, _> = self.connection.query_row(
-            "SELECT ts FROM forecasts WHERE market_id = ?1 ORDER BY ts DESC LIMIT 1",
-            params![market_id],
+            r#"
+            SELECT ts FROM forecasts
+            WHERE market_id = ?1
+              AND (?2 IS NULL OR model_version LIKE ?2 || '%')
+            ORDER BY ts DESC LIMIT 1
+            "#,
+            params![market_id, model_version_prefix],
             |row| row.get(0),
         );
         match result {
