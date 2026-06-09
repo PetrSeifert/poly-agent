@@ -74,9 +74,11 @@ cargo run --release -- run \
 
 Notes:
 
-- Each Codex forecast takes 30–90 seconds; `--max-llm-calls` caps calls per
-  cycle and stale forecasts are refreshed first. Markets closing within the
-  policy's minimum time-to-close are never sent to the LLM.
+- Codex forecasts run concurrently (one `codex exec` process each), so a
+  batch costs roughly one forecast's latency (30–90s). `--max-llm-calls`
+  caps calls (and thus concurrent processes) per cycle; stale forecasts are
+  refreshed first, and markets closing within the policy's minimum
+  time-to-close are never sent to the LLM.
 - `--model` overrides the Codex model and `--reasoning-effort` the thinking
   level (`minimal|low|medium|high|xhigh`, default `medium`). On a
   ChatGPT-subscription login,

@@ -223,9 +223,9 @@ async fn run_simulation(
         }
         stale.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
-        let mut llm_calls = 0;
+        let mut candidates = Vec::new();
         for (_, market) in &stale {
-            if llm_calls >= config.max_llm_calls {
+            if candidates.len() >= config.max_llm_calls {
                 break;
             }
             let Some(yes_token) = &market.yes_token_id else {
@@ -242,8 +242,26 @@ async fn run_simulation(
                 warn!(market = %market.slug, "empty book, skipping forecast");
                 continue;
             }
-            info!(market = %market.slug, "requesting codex forecast");
-            match forecaster.forecast(market, &yes_book).await {
+            candidates.push((*market, yes_book));
+        }
+
+        // Each forecast is an independent codex process, so run them all
+        // concurrently instead of paying 30-90s per market sequentially.
+        if !candidates.is_empty() {
+            info!(
+                count = candidates.len(),
+                "requesting codex forecasts concurrently"
+            );
+        }
+        let results = futures::future::join_all(candidates.iter().map(|(market, yes_book)| {
+            let forecaster = &forecaster;
+            async move { (market, forecaster.forecast(market, yes_book).await) }
+        }))
+        .await;
+
+        let mut llm_calls = 0;
+        for (market, result) in results {
+            match result {
                 Ok(forecast) => {
                     info!(
                         market = %market.slug,
