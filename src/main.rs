@@ -2,11 +2,12 @@ mod broker;
 mod exchange;
 mod forecast;
 mod ledger;
+mod llm;
 mod policy;
 mod types;
 
 use clap::{Parser, Subcommand};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::broker::{PaperBroker, PaperBrokerConfig};
 use crate::exchange::{ExchangeAdapter, PolymarketIntl};
@@ -61,6 +62,34 @@ enum Command {
     },
     /// Show paper account state: cash, fees, open positions, marked equity.
     Report,
+    /// Run the full simulation loop for several hours using Codex forecasts:
+    /// discover -> snapshot -> LLM forecast -> paper trade -> equity snapshot.
+    Run {
+        /// Total duration of the simulation in hours (fractions allowed).
+        #[arg(long, default_value_t = 4.0)]
+        hours: f64,
+        /// Minutes between cycles.
+        #[arg(long, default_value_t = 15.0)]
+        cycle_minutes: f64,
+        /// Number of top-volume markets to track.
+        #[arg(long, default_value_t = 20)]
+        markets: usize,
+        /// Maximum Codex forecast calls per cycle (they are slow).
+        #[arg(long, default_value_t = 5)]
+        max_llm_calls: usize,
+        /// Re-forecast a market only when its forecast is older than this.
+        #[arg(long, default_value_t = 2.0)]
+        forecast_refresh_hours: f64,
+        /// Minimum post-fee edge in probability points.
+        #[arg(long, default_value_t = 0.05)]
+        min_edge: f64,
+        /// Codex model override (e.g. gpt-5-codex); defaults to the CLI default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Codex binary to invoke.
+        #[arg(long, default_value = "codex")]
+        codex_bin: String,
+    },
 }
 
 #[tokio::main]
@@ -87,7 +116,172 @@ async fn main() -> anyhow::Result<()> {
         } => run_forecast(&ledger, &exchange, market_id, prob, limit).await,
         Command::Trade { limit, min_edge } => trade(&ledger, &exchange, limit, min_edge).await,
         Command::Report => report(&ledger),
+        Command::Run {
+            hours,
+            cycle_minutes,
+            markets,
+            max_llm_calls,
+            forecast_refresh_hours,
+            min_edge,
+            model,
+            codex_bin,
+        } => {
+            let forecaster = llm::CodexForecaster {
+                binary: codex_bin,
+                model,
+                ..llm::CodexForecaster::default()
+            };
+            run_simulation(
+                &ledger,
+                &exchange,
+                &forecaster,
+                RunConfig {
+                    hours,
+                    cycle_minutes,
+                    markets,
+                    max_llm_calls,
+                    forecast_refresh_hours,
+                    min_edge,
+                },
+            )
+            .await
+        }
     }
+}
+
+struct RunConfig {
+    hours: f64,
+    cycle_minutes: f64,
+    markets: usize,
+    max_llm_calls: usize,
+    forecast_refresh_hours: f64,
+    min_edge: f64,
+}
+
+async fn run_simulation(
+    ledger: &Ledger,
+    exchange: &PolymarketIntl,
+    forecaster: &llm::CodexForecaster,
+    config: RunConfig,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs_f64(config.hours * 3600.0);
+    let cycle_duration = std::time::Duration::from_secs_f64(config.cycle_minutes * 60.0);
+    let refresh_age = chrono::Duration::seconds((config.forecast_refresh_hours * 3600.0) as i64);
+    let mut cycle = 0u32;
+
+    info!(
+        hours = config.hours,
+        cycle_minutes = config.cycle_minutes,
+        markets = config.markets,
+        max_llm_calls = config.max_llm_calls,
+        "starting simulation run"
+    );
+
+    loop {
+        cycle += 1;
+        let cycle_started = std::time::Instant::now();
+        info!(cycle, "cycle start");
+
+        if let Err(error) = discover(ledger, exchange, config.markets).await {
+            error!(%error, "discovery failed, continuing with stored markets");
+        }
+        if let Err(error) = record(ledger, exchange, config.markets).await {
+            error!(%error, "snapshot recording failed");
+        }
+
+        // Forecast the markets with the stalest forecasts first, within budget.
+        let markets = ledger.markets_with_tokens(config.markets)?;
+        let min_close = chrono::Utc::now()
+            + chrono::Duration::seconds((PolicyConfig::default().min_hours_to_close * 3600.0) as i64);
+        let mut stale: Vec<(chrono::Duration, &types::Market)> = Vec::new();
+        for market in &markets {
+            // Don't spend LLM calls on markets the policy will reject anyway.
+            if let Some(close_time) = market.close_time
+                && close_time < min_close
+            {
+                continue;
+            }
+            let age = ledger
+                .forecast_age(&market.market_id)?
+                .unwrap_or(chrono::Duration::days(3650));
+            if age > refresh_age {
+                stale.push((age, market));
+            }
+        }
+        stale.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+
+        let mut llm_calls = 0;
+        for (_, market) in &stale {
+            if llm_calls >= config.max_llm_calls {
+                break;
+            }
+            let Some(yes_token) = &market.yes_token_id else {
+                continue;
+            };
+            let yes_book = match exchange.get_orderbook(yes_token).await {
+                Ok(book) => book,
+                Err(error) => {
+                    warn!(market = %market.slug, %error, "no book, skipping forecast");
+                    continue;
+                }
+            };
+            if yes_book.midpoint().is_none() {
+                warn!(market = %market.slug, "empty book, skipping forecast");
+                continue;
+            }
+            info!(market = %market.slug, "requesting codex forecast");
+            match forecaster.forecast(market, &yes_book).await {
+                Ok(forecast) => {
+                    info!(
+                        market = %market.slug,
+                        fair_prob_yes = forecast.fair_prob_yes,
+                        confidence = forecast.confidence,
+                        "codex forecast stored"
+                    );
+                    ledger.insert_forecast(&forecast)?;
+                    llm_calls += 1;
+                }
+                Err(error) => {
+                    error!(market = %market.slug, %error, "codex forecast failed");
+                }
+            }
+        }
+
+        if let Err(error) = trade(ledger, exchange, config.markets, config.min_edge).await {
+            error!(%error, "trade pass failed");
+        }
+
+        match ledger.record_equity_snapshot() {
+            Ok((liquidation, midpoint)) => {
+                info!(
+                    cycle,
+                    llm_calls,
+                    equity_liquidation = format!("{liquidation:.2}"),
+                    equity_midpoint = format!("{midpoint:.2}"),
+                    "cycle complete"
+                );
+            }
+            Err(error) => error!(%error, "equity snapshot failed"),
+        }
+
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let elapsed = cycle_started.elapsed();
+        if elapsed < cycle_duration {
+            let sleep_duration = cycle_duration - elapsed;
+            // Don't oversleep past the deadline.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(sleep_duration.min(remaining)).await;
+        }
+    }
+
+    info!(cycles = cycle, "simulation run finished");
+    report(ledger)
 }
 
 async fn discover(
@@ -336,6 +530,33 @@ fn report(ledger: &Ledger) -> anyhow::Result<()> {
         println!("equity (midpoint):    {:.2}", summary.cash + mtm_mid);
     } else {
         println!("equity: incomplete marks; run `record` to refresh snapshots");
+    }
+
+    let (filled, rejected) = ledger.order_counts()?;
+    println!("orders: {filled} filled, {rejected} rejected");
+
+    let curve = ledger.equity_curve(500)?;
+    if !curve.is_empty() {
+        println!("\nequity curve (liquidation-marked):");
+        let values: Vec<f64> = curve.iter().map(|point| point.1).collect();
+        let low = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let high = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let span = (high - low).max(1e-9);
+        for (ts, liquidation, midpoint, open_positions) in &curve {
+            let width = 40usize;
+            let filled_width =
+                (((liquidation - low) / span) * width as f64).round() as usize;
+            let bar: String = "#".repeat(filled_width.min(width));
+            println!(
+                "  {}  {:>9.2} liq / {:>9.2} mid  ({} pos) |{:<width$}|",
+                &ts[..19.min(ts.len())],
+                liquidation,
+                midpoint,
+                open_positions,
+                bar,
+                width = width
+            );
+        }
     }
     Ok(())
 }

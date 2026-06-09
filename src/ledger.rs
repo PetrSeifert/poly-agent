@@ -118,6 +118,15 @@ impl Ledger {
                     realized_pnl REAL NOT NULL,
                     total_fees REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS equity_snapshots(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    cash REAL NOT NULL,
+                    mtm_liquidation REAL NOT NULL,
+                    mtm_mid REAL NOT NULL,
+                    open_positions INTEGER NOT NULL
+                );
                 "#,
             )
             .context("creating ledger schema")?;
@@ -425,6 +434,88 @@ impl Ledger {
             total_fees,
             open_positions,
         })
+    }
+
+    /// Age of the newest forecast for a market, if any.
+    pub fn forecast_age(&self, market_id: &str) -> anyhow::Result<Option<chrono::Duration>> {
+        let result: Result<String, _> = self.connection.query_row(
+            "SELECT ts FROM forecasts WHERE market_id = ?1 ORDER BY ts DESC LIMIT 1",
+            params![market_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(raw) => {
+                let ts = chrono::DateTime::parse_from_rfc3339(&raw)
+                    .context("parsing forecast timestamp")?
+                    .with_timezone(&Utc);
+                Ok(Some(Utc::now() - ts))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Mark all open positions against the latest snapshots and persist an
+    /// equity point. Returns (liquidation_equity, midpoint_equity).
+    pub fn record_equity_snapshot(&self) -> anyhow::Result<(f64, f64)> {
+        let summary = self.summary()?;
+        let mut mtm_liquidation = 0.0;
+        let mut mtm_mid = 0.0;
+        for position in &summary.open_positions {
+            if let Some((best_bid, midpoint)) = self.latest_snapshot_quote(&position.token_id)? {
+                mtm_liquidation += position.shares * best_bid;
+                mtm_mid += position.shares * midpoint;
+            }
+        }
+        self.connection.execute(
+            r#"
+            INSERT INTO equity_snapshots(ts, cash, mtm_liquidation, mtm_mid, open_positions)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                Utc::now().to_rfc3339(),
+                summary.cash,
+                mtm_liquidation,
+                mtm_mid,
+                summary.open_positions.len() as i64,
+            ],
+        )?;
+        Ok((
+            summary.cash + mtm_liquidation,
+            summary.cash + mtm_mid,
+        ))
+    }
+
+    pub fn equity_curve(&self, limit: usize) -> anyhow::Result<Vec<(String, f64, f64, i64)>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT ts, cash + mtm_liquidation, cash + mtm_mid, open_positions
+            FROM equity_snapshots ORDER BY ts DESC LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut points = Vec::new();
+        for row in rows {
+            points.push(row?);
+        }
+        points.reverse();
+        Ok(points)
+    }
+
+    pub fn order_counts(&self) -> anyhow::Result<(i64, i64)> {
+        let filled = self.connection.query_row(
+            "SELECT COUNT(*) FROM orders WHERE status != 'rejected'",
+            [],
+            |row| row.get(0),
+        )?;
+        let rejected = self.connection.query_row(
+            "SELECT COUNT(*) FROM orders WHERE status = 'rejected'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((filled, rejected))
     }
 
     pub fn latest_snapshot_quote(&self, token_id: &str) -> anyhow::Result<Option<(f64, f64)>> {

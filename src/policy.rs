@@ -75,8 +75,10 @@ pub fn evaluate(
 
     let market_prob = (best_bid + best_ask) / 2.0;
     // Shrink toward the market until the agent has proven calibration.
-    let fair_prob = config.forecast_weight * forecast.fair_prob_yes
-        + (1.0 - config.forecast_weight) * market_prob;
+    // Scaling by the model's own confidence means a confidence of 0
+    // (e.g. "do not trade") collapses to the market price and produces no edge.
+    let weight = (config.forecast_weight * forecast.confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let fair_prob = weight * forecast.fair_prob_yes + (1.0 - weight) * market_prob;
 
     let yes_fee = config.fee_rate * best_ask * (1.0 - best_ask);
     let yes_edge = fair_prob - best_ask - yes_fee;
