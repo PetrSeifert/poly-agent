@@ -137,3 +137,8 @@ resolution data, limit-order queue simulation, WebSocket streaming,
 calibration/evaluation reports, the LLM research layer, and any live adapter.
 `ExecutionMode` already enumerates the live modes so enabling them later is an
 explicit, typed decision.
+
+## License
+
+Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+See `LICENSE-APACHE` and `LICENSE-MIT`.
