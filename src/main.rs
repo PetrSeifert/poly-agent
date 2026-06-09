@@ -86,6 +86,9 @@ enum Command {
         /// Codex model override (e.g. gpt-5-codex); defaults to the CLI default.
         #[arg(long)]
         model: Option<String>,
+        /// Thinking level for the model.
+        #[arg(long, default_value = "medium", value_parser = ["minimal", "low", "medium", "high", "xhigh"])]
+        reasoning_effort: String,
         /// Codex binary to invoke.
         #[arg(long, default_value = "codex")]
         codex_bin: String,
@@ -124,11 +127,13 @@ async fn main() -> anyhow::Result<()> {
             forecast_refresh_hours,
             min_edge,
             model,
+            reasoning_effort,
             codex_bin,
         } => {
             let forecaster = llm::CodexForecaster {
                 binary: codex_bin,
                 model,
+                reasoning_effort: Some(reasoning_effort),
                 ..llm::CodexForecaster::default()
             };
             run_simulation(

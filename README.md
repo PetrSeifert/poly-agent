@@ -77,8 +77,14 @@ Notes:
 - Each Codex forecast takes 30–90 seconds; `--max-llm-calls` caps calls per
   cycle and stale forecasts are refreshed first. Markets closing within the
   policy's minimum time-to-close are never sent to the LLM.
-- `--model` overrides the Codex model, `--codex-bin` the binary path
-  (e.g. `~/.local/bin/codex` if it is not on `PATH`).
+- `--model` overrides the Codex model and `--reasoning-effort` the thinking
+  level (`minimal|low|medium|high|xhigh`, default `medium`). On a
+  ChatGPT-subscription login,
+  `gpt-5.5` (default) and `gpt-5.4` are available; API-only slugs like
+  `*-codex` and `*-mini` are rejected. Both are recorded in the forecast's
+  `model_version` (e.g. `codex-exec-v1:gpt-5.4:low`) so runs can be compared.
+- `--codex-bin` sets the binary path (e.g. `~/.local/bin/codex` if it is not
+  on `PATH`).
 - Watch results live with `cargo run -- report` from another terminal; the
   equity curve (liquidation- and midpoint-marked) accumulates one point per
   cycle in `equity_snapshots`.

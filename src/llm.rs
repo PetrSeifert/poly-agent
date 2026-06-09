@@ -14,6 +14,8 @@ use crate::types::{Forecast, Market, OrderBook};
 pub struct CodexForecaster {
     pub binary: String,
     pub model: Option<String>,
+    /// Thinking level: minimal | low | medium | high (model-dependent).
+    pub reasoning_effort: Option<String>,
     pub timeout: std::time::Duration,
 }
 
@@ -22,6 +24,7 @@ impl Default for CodexForecaster {
         Self {
             binary: "codex".to_string(),
             model: None,
+            reasoning_effort: None,
             timeout: std::time::Duration::from_secs(300),
         }
     }
@@ -62,6 +65,9 @@ impl CodexForecaster {
             .arg("--sandbox")
             .arg("read-only")
             .arg("--skip-git-repo-check")
+            // Forecasting needs no user MCP servers or project rules, and
+            // loading them adds latency and noise.
+            .arg("--ignore-user-config")
             // Read prompt from stdin to avoid argv length/quoting issues.
             .arg("-")
             .stdin(Stdio::piped())
@@ -69,6 +75,11 @@ impl CodexForecaster {
             .stderr(Stdio::piped());
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            command
+                .arg("-c")
+                .arg(format!("model_reasoning_effort={effort:?}"));
         }
 
         let mut child = command.spawn().context(
@@ -113,9 +124,15 @@ impl CodexForecaster {
             market_id: market.market_id.clone(),
             fair_prob_yes: response.fair_prob_yes,
             confidence: response.confidence.clamp(0.0, 1.0),
-            model_version: match &self.model {
-                Some(model) => format!("{MODEL_VERSION_PREFIX}:{model}"),
-                None => MODEL_VERSION_PREFIX.to_string(),
+            model_version: {
+                let mut version = MODEL_VERSION_PREFIX.to_string();
+                if let Some(model) = &self.model {
+                    version.push_str(&format!(":{model}"));
+                }
+                if let Some(effort) = &self.reasoning_effort {
+                    version.push_str(&format!(":{effort}"));
+                }
+                version
             },
             rationale: json!({
                 "source": "codex_exec",
