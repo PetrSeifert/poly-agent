@@ -20,8 +20,8 @@ execution, no keys, no authentication.
   forecast staleness) ranks markets for the scarce LLM forecast budget.
 - **Ledger** (`src/ledger.rs`): SQLite schema for markets, orderbook
   snapshots (including CLOB condition ID, exchange timestamp, and book hash),
-  forecasts, orders, fills, positions, resolutions, settlements, and the
-  paper account.
+  token book status/cooldowns for CLOB 404s and empty books, forecasts,
+  orders, fills, positions, resolutions, settlements, and the paper account.
 - **Paper broker** (`src/broker.rs`): simulates marketable orders by walking
   the live book — fills against real depth, applies the `feeRate * p * (1 - p)`
   taker fee model, tracks slippage, and rejects orders the book cannot satisfy
@@ -101,11 +101,13 @@ Notes:
 
 - Codex forecasts run concurrently (one `codex exec` process each), so a
   batch costs roughly one forecast's latency (30–90s). `--max-llm-calls`
-  caps calls (and thus concurrent processes) per cycle. The budget goes to
-  the highest opportunity-score markets among those with stale forecasts
-  (only real Codex forecasts count toward freshness, not stubs). Markets
-  closing within the policy's minimum time-to-close, and books priced
-  outside 0.05–0.95 (no achievable taker edge), are never sent to the LLM.
+  caps calls (and thus concurrent processes) per cycle. Each cycle first
+  fetches books for a wider metadata-filtered candidate set, suppresses
+  repeated CLOB 404/empty-book tokens, then spends the budget only on
+  executable markets with both YES/NO books, non-empty top-of-book, acceptable
+  spread/depth, non-extreme YES midpoint (0.10–0.90), enough time to close,
+  and stale real Codex forecasts. Logs include `executable universe summary`
+  and `forecast budget summary` lines with skip counts.
 - `--model` overrides the Codex model and `--reasoning-effort` the thinking
   level (`minimal|low|medium|high|xhigh`, default `medium`). On a
   ChatGPT-subscription login,
@@ -114,6 +116,10 @@ Notes:
   `model_version` (e.g. `codex-exec-v1:gpt-5.4:low`) so runs can be compared.
 - `--codex-bin` sets the binary path (e.g. `~/.local/bin/codex` if it is not
   on `PATH`).
+- Use `--diagnostic-small-orders` with a lower `--min-edge` when you want to
+  exercise paper fills/accounting without treating the result as alpha; order
+  budget is capped to about $2 and orders are labelled with a diagnostic
+  policy version.
 - Watch results live with `cargo run -- report` from another terminal; the
   equity curve (liquidation- and midpoint-marked) accumulates one point per
   cycle in `equity_snapshots`.

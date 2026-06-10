@@ -1,5 +1,5 @@
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
 use crate::types::{
@@ -9,6 +9,31 @@ use crate::types::{
 
 pub struct Ledger {
     connection: Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenBookStatusKind {
+    Ok,
+    Empty,
+    NotFound,
+    Error,
+}
+
+impl TokenBookStatusKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenBookStatusKind::Ok => "ok",
+            TokenBookStatusKind::Empty => "empty",
+            TokenBookStatusKind::NotFound => "not_found",
+            TokenBookStatusKind::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenSuppression {
+    pub last_status: String,
+    pub suppress_until: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +133,16 @@ impl Ledger {
                     spread REAL,
                     midpoint REAL,
                     raw_book_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS token_book_status(
+                    token_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    last_status TEXT NOT NULL,
+                    last_error TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    suppress_until TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS forecasts(
@@ -319,6 +354,69 @@ impl Ledger {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn record_token_book_status(
+        &self,
+        market_id: &str,
+        token_id: &str,
+        status: TokenBookStatusKind,
+        error: Option<&str>,
+        suppress_for: Option<chrono::Duration>,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let suppress_until = suppress_for.map(|duration| (now + duration).to_rfc3339());
+        self.connection.execute(
+            r#"
+            INSERT INTO token_book_status(
+                token_id, market_id, last_status, last_error,
+                first_seen_at, last_checked_at, suppress_until
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(token_id) DO UPDATE SET
+                market_id = excluded.market_id,
+                last_status = excluded.last_status,
+                last_error = excluded.last_error,
+                last_checked_at = excluded.last_checked_at,
+                suppress_until = excluded.suppress_until
+            "#,
+            params![
+                token_id,
+                market_id,
+                status.as_str(),
+                error,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+                suppress_until,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn token_suppression(&self, token_id: &str) -> anyhow::Result<Option<TokenSuppression>> {
+        let result = self.connection.query_row(
+            r#"
+            SELECT last_status, suppress_until FROM token_book_status
+            WHERE token_id = ?1 AND suppress_until IS NOT NULL
+            "#,
+            params![token_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        let (last_status, suppress_until_raw) = match result {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let suppress_until = DateTime::parse_from_rfc3339(&suppress_until_raw)
+            .context("parsing token suppression timestamp")?
+            .with_timezone(&Utc);
+        if suppress_until > Utc::now() {
+            Ok(Some(TokenSuppression {
+                last_status,
+                suppress_until,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn insert_forecast(&self, forecast: &Forecast) -> anyhow::Result<()> {

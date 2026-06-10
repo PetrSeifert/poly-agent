@@ -4,6 +4,21 @@ use serde::Deserialize;
 
 use crate::types::{Market, MarketFilter, MarketResolution, OrderBook, PriceLevel, Venue};
 
+#[derive(Debug, thiserror::Error)]
+#[error("clob book for {token_id} returned {status}")]
+pub struct ClobBookStatusError {
+    pub token_id: String,
+    pub status: reqwest::StatusCode,
+}
+
+pub fn clob_book_status(error: &anyhow::Error) -> Option<reqwest::StatusCode> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ClobBookStatusError>()
+            .map(|error| error.status)
+    })
+}
+
 #[async_trait::async_trait]
 pub trait ExchangeAdapter: Send + Sync {
     fn venue(&self) -> Venue;
@@ -258,12 +273,13 @@ impl ExchangeAdapter for PolymarketIntl {
             .send()
             .await
             .context("requesting clob book")?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "clob book for {} returned {}",
-                token_id,
-                response.status()
-            ));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ClobBookStatusError {
+                token_id: token_id.to_string(),
+                status,
+            }
+            .into());
         }
         let raw: ClobBook = response.json().await.context("decoding clob book")?;
 

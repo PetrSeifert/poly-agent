@@ -1,4 +1,4 @@
-use crate::types::{Market, OrderBook};
+use crate::types::Market;
 
 /// Market domains ranked by how repeatable the agent's edge is, per
 /// MARKET_AGENT_RESEARCH.md: structured-data domains (crypto, sports,
@@ -289,30 +289,6 @@ pub fn profile(market: &Market) -> TriageProfile {
         forecast_priority,
         rules_clarity: clarity,
     }
-}
-
-/// Score for ranking which markets deserve scarce LLM forecast calls, loosely
-/// following the research's opportunity_score: category edge prior, liquidity,
-/// resolution clarity, spread tightness, and forecast staleness.
-pub fn opportunity_score(
-    profile: &TriageProfile,
-    market: &Market,
-    yes_book: &OrderBook,
-    forecast_age_hours: f64,
-) -> f64 {
-    if profile.forecast_priority <= 0.0 {
-        return 0.0;
-    }
-    let liquidity_score = (market.liquidity.unwrap_or(0.0) / 50_000.0).clamp(0.0, 1.0);
-    let spread_score = match yes_book.spread() {
-        Some(spread) => (1.0 - spread / 0.10).clamp(0.0, 1.0),
-        None => 0.0,
-    };
-    let staleness_score = (forecast_age_hours / 24.0).clamp(0.0, 1.0);
-    0.40 * profile.forecast_priority
-        + 0.20 * liquidity_score
-        + 0.20 * spread_score
-        + 0.20 * staleness_score
 }
 
 #[cfg(test)]
